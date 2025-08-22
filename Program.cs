@@ -2,9 +2,10 @@
 using TL; // WTelegramClient
 
 // ---------------- CONFIGURATION ----------------
+var dir = Directory.GetCurrentDirectory();
 var config = new ConfigurationBuilder()
-    .SetBasePath(Directory.GetCurrentDirectory())
-    .AddJsonFile("appsettings.dev.json", optional: true, reloadOnChange: true)
+    .SetBasePath(dir)
+    .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
     .AddEnvironmentVariables()
     .Build();
 
@@ -22,80 +23,64 @@ bool running = true;
 
 // ---------------- TELEGRAM CLIENT ----------------
 using var client = new WTelegram.Client(WtConfig);
-
+client.OnUpdates += OnUpdate;
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; running = false; };
 
 Console.WriteLine("Logging in to Telegram… (first run may prompt for code/password)");
 await client.LoginUserIfNeeded();
 
 Console.WriteLine("Listener started. Press Ctrl+C to exit.");
-foreach (var ch in channels)
+var peer = await client.Contacts_ResolveUsername(channels.First());
+
+if (peer.peer is not PeerChannel pch)
 {
-    try
-    {
-        var r = await client.Contacts_ResolveUsername(ch.TrimStart('@'));
-        Console.WriteLine($"  • subscribed to @{ch.TrimStart('@')} (id={r.UserOrChat?.ID})");
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"  ! cannot resolve @{ch}: {ex.Message}");
-    }
+    throw new InvalidDataException($"{channels.First()} is not a channel");
 }
 
-await foreach (var update in client.Updates)
+var targetChannelId = pch.channel_id;
+var getAllChatsTask = client.Messages_GetAllChats();
+getAllChatsTask.Wait();
+
+
+if (!getAllChatsTask.Result.chats.TryGetValue(targetChannelId, out ChatBase channel))
 {
-    try
-    {
-        await OnUpdate(update);
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error processing update: {ex.Message}");
-    }
+    throw new InvalidDataException($"ID {targetChannelId} does not match with any channel");
 }
 
 // ---------------- MAIN LOOP ----------------
-while (running) await Task.Delay(500);
+while (running) Task.Delay(500).Wait();
 await client.DisposeAsync();
 Console.WriteLine("Stopped.");
 
 // ================== HELPERS ==================
 
-async Task OnUpdate(IObject upd)
+Task OnUpdate(IObject update)
 {
-    if (upd is not UpdatesBase ubase) return;
-
-    foreach (var u in ubase.UpdateList)
+    if (update is UpdatesBase updates)
     {
-        Message? msg = u switch
+        foreach (var u in updates.UpdateList)
         {
-            UpdateNewChannelMessage uncm   => uncm.message as Message,
-            UpdateEditChannelMessage uecm  => uecm.message as Message,
-            UpdateNewMessage unm           => unm.message as Message,
-            _ => null
-        };
-        if (msg is null || msg.peer_id is not PeerChannel pch) continue;
-        if (msg.message is null && msg.media is null) continue;
+            switch (u)
+            {
+                case UpdateNewChannelMessage uncm when uncm.message is Message msg:
+                    if (msg.peer_id is PeerChannel pch)
+                    {
+                        Console.WriteLine(
+                            $"[{msg.date:u}] " +
+                            $"Channel {pch.channel_id}, Msg {msg.id}: {msg.message}"
+                        );
+                    }
+                    break;
 
-        var chats = await client.Messages_GetChats(pch.channel_id);
-        var channel = chats.chats.TryGetValue(pch.channel_id, out var ch) ? ch as Channel : null;
-        var username = (channel?.username ?? "").ToLowerInvariant();
+                case UpdateNewMessage unm when unm.message is Message dm:
+                    Console.WriteLine($"DM {dm.id}: {dm.message}");
+                    break;
 
-        if (channels.Length > 0)
-        {
-            bool match = channels.Any(c =>
-                (c.StartsWith("-100") && c == $"-100{pch.channel_id}") ||
-                (c.TrimStart('@').Equals(username, StringComparison.OrdinalIgnoreCase)));
-            if (!match) continue;
+                // при желании: UpdateEditChannelMessage, UpdateDeleteMessages, и т.д.
+            }
         }
-
-        var text = msg.message ?? "";
-        var snippet = text.Length > 120 ? text[..120] + "…" : text;
-        var ts = msg.date.ToLocalTime();
-        var link = !string.IsNullOrEmpty(username) ? $"https://t.me/{username}/{msg.id}" : "(no link)";
-
-        Console.WriteLine($"\n[{ts:yyyy-MM-dd HH:mm:ss}] @{username} #{msg.id}\n{snippet}\n{link}");
     }
+    return Task.CompletedTask;
 }
 
 // функция для WTelegram
