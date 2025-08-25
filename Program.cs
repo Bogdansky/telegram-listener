@@ -1,5 +1,7 @@
 ﻿using Microsoft.Extensions.Configuration;
+using Telegram_Listener;
 using TL; // WTelegramClient
+using Amazon.SQS;
 
 // ---------------- CONFIGURATION ----------------
 var dir = Directory.GetCurrentDirectory();
@@ -9,15 +11,16 @@ var config = new ConfigurationBuilder()
     .AddEnvironmentVariables()
     .Build();
 
-string? apiId       = Config("Telegram:ApiId", "TG_API_ID");
-string? apiHash     = Config("Telegram:ApiHash", "TG_API_HASH");
-string? phone       = Config("Telegram:Phone", "TG_PHONE");
-string? password    = Config("Telegram:Password", "TG_PASSWORD");
-string? sessionPath = Config("General:SessionPath", "SESSION_PATH") ?? "./session.dat";
+var apiId       = Config("Telegram:ApiId", "TG_API_ID");
+var apiHash     = Config("Telegram:ApiHash", "TG_API_HASH");
+var phone       = Config("Telegram:Phone", "TG_PHONE");
+var password    = Config("Telegram:Password", "TG_PASSWORD");
+var sessionPath = Config("General:SessionPath", "SESSION_PATH") ?? "./session.dat";
 string[] channels   = (Config("General:Channels", "CHANNELS") ?? "")
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
-string? sqsQueueUrl = Config("AWS:SqsQueueUrl", "SQS_QUEUE_URL");
+var sqsQueueUrl = Config("AWS:SqsQueueUrl", "SQS_QUEUE_URL");
+var awsRegion = Config("AWS:Region", "AWS_REGION") ?? Amazon.RegionEndpoint.EUNorth1.SystemName; // Default to EUNorth1 if not specified
 
 bool running = true;
 
@@ -54,33 +57,95 @@ Console.WriteLine("Stopped.");
 
 // ================== HELPERS ==================
 
-Task OnUpdate(IObject update)
+async Task OnUpdate(IObject update)
 {
-    if (update is UpdatesBase updates)
+    try
     {
-        foreach (var u in updates.UpdateList)
+        List<SqsMessage> messages = new();
+        if (update is UpdatesBase updates)
         {
-            switch (u)
+            foreach (var u in updates.UpdateList)
             {
-                case UpdateNewChannelMessage uncm when uncm.message is Message msg:
-                    if (msg.peer_id is PeerChannel pch)
-                    {
-                        Console.WriteLine(
-                            $"[{msg.date:u}] " +
-                            $"Channel {pch.channel_id}, Msg {msg.id}: {msg.message}"
-                        );
-                    }
-                    break;
+                switch (u)
+                {
+                    case UpdateNewChannelMessage uncm when uncm.message is Message msg:
+                        if (msg.peer_id is PeerChannel pch)
+                        {
+                            var link = $"https://t.me/c/{pch.channel_id}/{msg.id}";
+                            messages.Add(new SqsMessage(msg.message, link));
+                            Console.WriteLine(
+                                $"[{msg.date:u}] " +
+                                $"Channel {pch.channel_id}, Msg {msg.id}: {msg.message}\n" +
+                                $"Link: {link}"
+                            );
+                        }
+                        break;
 
-                case UpdateNewMessage unm when unm.message is Message dm:
-                    Console.WriteLine($"DM {dm.id}: {dm.message}");
-                    break;
+                    case UpdateNewMessage unm when unm.message is Message dm:
+                        Console.WriteLine($"DM {dm.id}: {dm.message}");
+                        break;
 
-                // при желании: UpdateEditChannelMessage, UpdateDeleteMessages, и т.д.
+                        // при желании: UpdateEditChannelMessage, UpdateDeleteMessages, и т.д.
+                }
             }
         }
+
+        // here we send messages to sqs
+        await SendMessagesToSqsAsync(messages);
     }
-    return Task.CompletedTask;
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Error processing update: {ex.Message}");
+    }
+}
+
+async Task SendMessagesToSqsAsync(IReadOnlyCollection<SqsMessage> messages)
+{
+    if (string.IsNullOrEmpty(sqsQueueUrl) || messages.Count == 0)
+        return;
+        
+    try
+    {
+        // Initialize the Amazon SQS client with the specified region
+        var sqsClient = new AmazonSQSClient(Amazon.RegionEndpoint.GetBySystemName(awsRegion));
+        
+        foreach (var message in messages)
+        {
+            // Create the request with message attributes
+            var sendMessageRequest = new Amazon.SQS.Model.SendMessageRequest
+            {
+                QueueUrl = sqsQueueUrl,
+                MessageBody = System.Text.Json.JsonSerializer.Serialize(message),
+                MessageAttributes = new Dictionary<string, Amazon.SQS.Model.MessageAttributeValue>
+                {
+                    { 
+                        "MessageType", 
+                        new Amazon.SQS.Model.MessageAttributeValue
+                        { 
+                            DataType = "String",
+                            StringValue = "TelegramMessage" 
+                        }
+                    }
+                }
+            };
+            
+            // Check if this is a FIFO queue (URL ends with .fifo)
+            if (sqsQueueUrl.EndsWith(".fifo", StringComparison.OrdinalIgnoreCase))
+            {
+                // Required for FIFO queues
+                sendMessageRequest.MessageGroupId = "telegram-messages";
+                sendMessageRequest.MessageDeduplicationId = Guid.NewGuid().ToString();
+            }
+            
+            // Send the message to SQS
+            var response = await sqsClient.SendMessageAsync(sendMessageRequest);
+            Console.WriteLine($"Message sent to SQS with ID: {response.MessageId}");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Error sending to SQS: {ex.Message}");
+    }
 }
 
 // функция для WTelegram
