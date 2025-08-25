@@ -20,7 +20,7 @@ string[] channels   = (Config("General:Channels", "CHANNELS") ?? "")
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
 var sqsQueueUrl = Config("AWS:SqsQueueUrl", "SQS_QUEUE_URL");
-var awsRegion = Config("AWS:Region", "AWS_REGION") ?? "us-east-1"; // Default to us-east-1 if not specified
+var awsRegion = Config("AWS:Region", "AWS_REGION") ?? Amazon.RegionEndpoint.EUNorth1.SystemName; // Default to EUNorth1 if not specified
 
 bool running = true;
 
@@ -107,7 +107,7 @@ async Task SendMessagesToSqsAsync(IReadOnlyCollection<SqsMessage> messages)
     try
     {
         // Initialize the Amazon SQS client with the specified region
-        var sqsClient = new AmazonSQSClient(Amazon.RegionEndpoint.EUNorth1);
+        var sqsClient = new AmazonSQSClient(Amazon.RegionEndpoint.GetBySystemName(awsRegion));
         
         foreach (var message in messages)
         {
